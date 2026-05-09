@@ -114,6 +114,18 @@ def cmd_compare(args: argparse.Namespace) -> None:
             f"Latency metrics are not comparable — evaluating tokens_per_sec only.{RESET}"
         )
 
+    # Warn when sequence lengths differ — tokens_per_sec is incomparable across seq lengths
+    # because longer sequences are more memory-bandwidth-bound (lower tok/s per token generated).
+    for dim in ("input_len", "output_len"):
+        b_val = baseline.get(dim)
+        c_val = candidate.get(dim)
+        if b_val is not None and c_val is not None and b_val != c_val:
+            print(
+                f"\n{RED}WARNING: {dim} changed ({b_val} → {c_val}). "
+                f"tokens_per_sec is NOT comparable across different sequence lengths. "
+                f"Re-run baseline with matching {dim} before drawing conclusions.{RESET}"
+            )
+
     all_metrics = [
         ("tokens_per_sec", "tok/s", True),   # higher is better — always compared
         ("avg_latency_ms", "ms",   False),   # lower is better — only when same batch
@@ -254,7 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     wrap_p.add_argument("raw_json", help="Path to raw --output-json file from vllm bench latency")
     wrap_p.add_argument("--batch-size", type=int, required=True)
     wrap_p.add_argument("--output-len", type=int, required=True)
-    wrap_p.add_argument("--input-len", type=int, default=128)
+    wrap_p.add_argument("--input-len", type=int, default=32)
     wrap_p.add_argument("--label", type=str, required=True, help="Short description of this run")
     wrap_p.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     wrap_p.add_argument("--device", type=str, default="cpu")
@@ -276,8 +288,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--candidate", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=8, help=argparse.SUPPRESS)
-    parser.add_argument("--output-len", type=int, default=128, help=argparse.SUPPRESS)
-    parser.add_argument("--input-len", type=int, default=128, help=argparse.SUPPRESS)
+    parser.add_argument("--output-len", type=int, default=32, help=argparse.SUPPRESS)
+    parser.add_argument("--input-len", type=int, default=32, help=argparse.SUPPRESS)
     parser.add_argument("--label", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct",
                         help=argparse.SUPPRESS)

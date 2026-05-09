@@ -9,3 +9,5 @@
 | 2 | OMP_NUM_THREADS=8 | — | -2.3% (miss) | reverted |
 | 3 | block-size=32 | — | -0.4% (miss) | reverted |
 | 4 | batch=16 | 68.0 | +12.8% | N/A (flag-only) |
+| 5 | code | Skip no-op copy_to_gpu() identity guard | — | +0.5% (miss) | reverted |
+| 6 | flag | batch=32 | 72.7 | +7.8% | dab1164 |
