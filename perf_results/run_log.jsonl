@@ -9,3 +9,4 @@
 {"timestamp": "2026-05-09T16:47:27.737239+00:00", "label": "code: skip no-op copy_to_gpu() identity guard", "tokens_per_sec": 67.7, "avg_latency_ms": 7563.052608026192, "p99_ms": 7616.251261387952, "config_flags": ""}
 {"timestamp": "2026-05-09T16:53:59.889922+00:00", "label": "flag: batch=32", "tokens_per_sec": 72.68, "avg_latency_ms": 14088.833557977341, "p99_ms": 14206.546709393151, "config_flags": ""}
 {"timestamp": "2026-05-09T17:06:42.416840+00:00", "label": "flag: batch=64", "tokens_per_sec": 76.61, "avg_latency_ms": 26731.20884138625, "p99_ms": 26798.55257299263, "config_flags": ""}
+{"timestamp": "2026-05-09T17:11:22.572321+00:00", "label": "flag: dtype=float32 (from bfloat16)", "tokens_per_sec": 356.7, "avg_latency_ms": 5741.440700204112, "p99_ms": 5913.7354050716385, "config_flags": ""}

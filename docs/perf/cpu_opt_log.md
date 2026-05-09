@@ -11,3 +11,4 @@
 | 4 | batch=16 | 68.0 | +12.8% | N/A (flag-only) |
 | 5 | code | Skip no-op copy_to_gpu() identity guard | — | +0.5% (miss) | reverted |
 | 6 | flag | batch=32 | 72.7 | +7.8% | dab1164 |
+| 7 | flag | batch=64 | 76.6 | +5.4% | a1d9863 |
