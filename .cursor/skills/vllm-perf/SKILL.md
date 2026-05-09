@@ -12,12 +12,17 @@ Read and follow this skill when the user asks to:
 
 ## What This Skill Does
 
-This skill runs an autonomous optimization loop that alternates between two fix types:
+This skill runs an autonomous optimization loop across three fix types:
 
-- **Flag/Config fixes** — CLI flags, environment variables, scheduler knobs
-- **Code fixes** — targeted edits to vLLM Python source files
+- **CodeEdit** — targeted edits to vLLM Python source files (hot-path waste elimination, caching, kernel selection)
+- **InductorConfig** — `--compilation-config '{"inductor_compile_config": {...}}'` options that retune how torch inductor compiles the model
+- **Flag** — CLI flags, environment variables, scheduler knobs
 
-Code fixes are **not optional add-ons**. Once cheap flags are exhausted, the loop must pivot to reading source code, identifying waste in the hot path, patching it, smoke-testing correctness, and benchmarking. Both fix types follow the same measure-commit-or-revert discipline.
+**Code fixes are the primary target.** Flag wins (especially batch scaling) are batch-size-specific: a +24% batch=128 win evaporates the moment someone runs at batch=8. A code fix improves efficiency at *every* batch size and compounds with future changes. The loop must be actively biased toward CodeEdit hypotheses; flags are used to establish a sane baseline and to fill iterations when the code scan surfaces nothing actionable.
+
+**Critical limitation:** once the model is compute-bound (typically batch ≥ 128 with float32 on M1 Pro), Python/numpy overhead in `_prepare_inputs` drops below the 3% measurement noise floor. Empirically tested 2026-05: eliminating `np.repeat` for `req_indices` in the decode path gave -2.1% (noise). At that point, the only levers are larger batch (if still sublinear), quantization, or torch.compile changes to the compiled forward pass — not Python-level cleanup.
+
+Both fix types follow the same measure-commit-or-revert discipline.
 
 ---
 
@@ -249,7 +254,7 @@ If this takes >2 minutes, something is wrong — likely wrong dtype. Stop and in
 
 **This is the core intelligence step. Run it before EVERY iteration.**
 
-You are an AI agent with code access, profiling data, and run history. Your job is to reason from evidence and pick the single highest-impact untried fix — flag or code.
+You are an AI agent with code access, profiling data, and run history. Your job is to find the highest-impact untried fix — **with a strong prior toward CodeEdit**. A code fix that eliminates 5% of decode-step overhead is worth more than a batch-size tweak that only holds at one specific batch size.
 
 ### Step 2a — Read the Evidence
 
@@ -261,7 +266,7 @@ cat perf_results/run_log.jsonl 2>/dev/null || echo "(no runs yet)"
 cat perf_results/prof_summary.txt 2>/dev/null || echo "(no profile yet)"
 ```
 
-### Step 2b — Code Scan (mandatory from iteration 3 onward, or whenever flag fixes stall)
+### Step 2b — Code Scan (mandatory EVERY iteration, not just from iteration 3)
 
 Read these files looking for hot-path waste. Skim for the anti-patterns listed below.
 
@@ -312,34 +317,51 @@ Answer these questions out loud before proposing hypotheses:
    - Correct dtype for this CPU architecture? (fp32 on ARM, bf16 OK on x86+AVX-512 BF16)
    - Reasonable batch size? (CPU can usually handle larger batches than GPU for small models)
    - Any red flags in the benchmark output? (unexpectedly slow warmup, OOM warnings)
+   - *If dtype or starting batch size is wrong, fix that first — these are prerequisite, not optimizations.*
 
-2. **What does current tokens/sec tell us?**
-   - Scales with batch (sublinear latency): compute underutilized, try larger batch
-   - Plateaus with batch: memory bandwidth is the ceiling, try quantization
-   - Flag fixes had zero effect: bottleneck is in code, not config
+2. **What did the code scan surface?**
+   - Is there per-step work that is repeated identically every decode step and could be cached or eliminated?
+   - Are there Python-level loops, allocations, or function calls whose cost scales with batch or seq-len but add no arithmetic value?
+   - Is there dead-branch overhead (cuda_graph checks, cascade_attn loops) that executes every step but always resolves the same way?
+   - **Rate each hit: "hot path + safe to change" → CodeEdit hypothesis. "cold path or risky" → skip.**
 
-3. **What does the profiler show (if captured)?**
-   - Which op takes the most wall time?
+3. **What does current tokens/sec tell us?**
+   - Strongly sublinear batch scaling (latency factor < 1.5× when batch doubles): compute underutilized, batch increase is still valid *but only after this session's code hypotheses are tried*
+   - Plateau or near-linear scaling: memory-bandwidth-bound, batch scaling is done; code or quantization only
+   - Token/sec flat despite config changes: bottleneck is definitely in the compiled hot path — profile before guessing
+
+4. **Is the model compute-bound? (Critical for CodeEdit viability)**
+
+   Estimate Python overhead fraction before proposing Python-level code fixes:
+   ```
+   step_latency_s   = avg_latency_s / output_len          # e.g. 9.24s / 32 = 0.29s/step
+   python_overhead  = ~1–5 ms/step (rough upper bound for _prepare_inputs at any batch)
+   overhead_pct     = python_overhead / step_latency_s     # e.g. 3ms / 290ms = ~1%
+   ```
+   - If `overhead_pct < 3%` → Python-level code fixes will be **below the measurement noise floor**. Still satisfy the batch-scaling gate by attempting one, but set expectation to miss and move on.
+   - If `overhead_pct ≥ 10%` → Python cleanup is worth pursuing seriously.
+   - Empirical threshold: at batch ≥ 128 with float32 on M1 Pro, overhead_pct ≈ 1% → noise floor.
+   - At batch ≤ 16, overhead_pct can be 10-30% and code fixes are worth prioritizing.
+
+5. **What does the profiler show (if captured)?**
+   - Which op dominates? Use the bottleneck → hypothesis table in Phase 4.
    - Are there surprising ops (unexpected copies, fallback kernels)?
 
-4. **What did previous iterations reveal?**
-   - What bottleneck did each accepted fix relieve?
-   - What does each rejected fix eliminate?
-
-5. **What did the code scan surface?**
-   - Are there per-step allocations, or dead branches in the hot path?
-   - Which is cheapest to fix safely?
+6. **What did previous iterations reveal?**
+   - Which bottleneck did each accepted fix relieve?
+   - What does each rejected fix rule out?
+   - **Have at least 2 code fix hypotheses been tested this session? If not, why not?**
 
 ### Step 2d — Generate Ranked Hypotheses
 
-Produce 3–5 hypotheses. Each must specify its type and include:
+Produce 3–5 hypotheses. **At least 2 must be CodeEdit or InductorConfig type.** If the code scan found nothing actionable, explain why (with file + line evidence), then and only then may you fill all slots with Flag hypotheses.
 
 ```
 Hypothesis N: <name>
-  Type      : Flag | EnvVar | CodeEdit
+  Type      : Flag | EnvVar | InductorConfig | CodeEdit
   Mechanism : WHY this increases tokens/sec — which bottleneck it removes
   Evidence  : what in profiler / code scan / run log supports this
-  Fix       : exact flag/env-var OR file:line with specific change described
+  Fix       : exact flag/env-var/config-json OR file:line with specific change described
   Est. gain : % estimate + confidence: low / medium / high
   Risk      : what could break; how to verify correctness
 ```
@@ -348,23 +370,45 @@ Hypothesis N: <name>
 
 ```
 SELECTED: Hypothesis N — <name>
-TYPE    : Flag | EnvVar | CodeEdit
+TYPE    : Flag | EnvVar | InductorConfig | CodeEdit
 REASON  : <one sentence from evidence above>
 ```
 
+**Selection tiebreaker:** if a CodeEdit hypothesis and a Flag hypothesis have estimated gains within 2× of each other, **select the CodeEdit**. Flag wins are batch-size-specific and evaporate when batch changes; a code fix improves efficiency at every batch size. The only exception is when the flag fixes a correctness prerequisite (dtype, starting batch, OOM avoidance).
+
+**Batch-scaling gate:** once the run log shows 2 or more accepted batch-scaling wins (regardless of iteration number), the next iteration MUST be a CodeEdit or InductorConfig attempt. Only return to batch scaling after a code-level attempt has been tried.
+
+**Noise-floor exception:** when Step 2c question 4 shows `overhead_pct < 3%`, the code attempt will almost certainly miss. Attempt it anyway to satisfy the gate, but explicitly state in the hypothesis: "Expected result: miss (noise floor — model is compute-bound). Purpose: satisfy batch-scaling gate." This prevents wasted deliberation about *why* it missed.
+
 ### Fallback Seed Catalog
 
-Use only when no code scan or profiler has surfaced a better hypothesis.
+Use only when the code scan and profiler have both been read and nothing actionable was found. Explain why each code anti-pattern from Step 2b was rejected before falling back here.
+
+**Code-first seeds** (try these before any batch scaling beyond the initial baseline):
+
+⚠️ **All priorities 1–4 operate on Python-level arrays of size `num_reqs`. At batch ≥ 128 with float32 on M1 Pro, these are ALL below the measurement noise floor (~1% overhead). Only pursue them seriously at batch ≤ 16 where Python overhead can reach 10–30% of step time.**
 
 | Priority | Type | Fix | Notes |
 |---|---|---|---|
-| 1 | Flag | `--batch-size 16` | CPU usually underutilized at small batch |
-| 2 | Flag | `--batch-size 32` | Continue if batch×2 showed sublinear latency scaling |
-| 3 | Flag | `--batch-size 64` | Continue if still sublinear; watch for OOM |
-| 4 | Flag | `--batch-size 128` | Try if 64 still sublinear; diminishing returns likely |
-| 5 | CodeEdit | Cache decode-step numpy arrays | `np.repeat`/`np.cumsum` in `_prepare_inputs` rebuild identical arrays every decode step |
-| 6 | CodeEdit | Hoist dead `if self.use_cuda_graph:` branches | Always False on CPU |
-| 7 | Flag | `--no-enable-chunked-prefill` | Marginal gain at in=32; only try after code fixes stall |
+| 1 | CodeEdit | Cache decode-step arrays in `_prepare_inputs` | During pure decode, `np.repeat(arange[:num_reqs], [1,1,...,1])`, `np.cumsum`, and `query_pos` are constant step-to-step — cache after first decode step. **Below noise floor at batch ≥ 128.** |
+| 2 | CodeEdit | Hoist dead `if self.use_cuda_graph:` branches | Always False on CPU; pure Python overhead every step. `CPUModelRunner` sets `self.use_cuda_graph = False` at init. **Below noise floor at batch ≥ 128.** |
+| 3 | CodeEdit | Skip `_compute_cascade_attn_prefix_lens` when `num_common_prefix_blocks` all-zero | **NOT applicable on CPU** — `CPUModelRunner.__init__` sets `self.cascade_attn_enabled = False`, so the call at line ~3949 is gated by `if self.cascade_attn_enabled` and never executes. |
+| 4 | CodeEdit | Inline `_get_cumsum_and_arange` for the all-ones decode case | `np.repeat(arange[:N], [1,1,...,1])` is just `arange[:N]`; skip repeat when `total_num_scheduled_tokens == num_reqs`. **Empirically tested 2026-05 at batch=128: -2.1% (noise).** |
+
+**Flag seeds** (use after attempting at least 1 code fix, or when code scan is conclusively empty):
+
+| Priority | Type | Fix | Notes |
+|---|---|---|---|
+| 5 | Flag | `--batch-size 16` | CPU usually underutilized at small batch |
+| 6 | Flag | `--batch-size 32` | Continue if batch×2 showed sublinear latency scaling (gain > 5%) |
+| 7 | Flag | `--batch-size 64` | Continue if still sublinear; watch for OOM |
+| 8 | Flag | `--batch-size 128` | Continue if still sublinear; +24% observed at this step in practice |
+| 9 | Flag | `--batch-size 256` | Diminishing returns — +4.6% observed, latency ratio 1.91× (above 1.7× stop threshold). Barely passes bench_compare 3% but trips the stop rule. |
+| 10 | Flag | `--no-enable-chunked-prefill` | Marginal gain at in=32; only try after code fixes stall |
+
+**Batch scaling stop rule:** stop doubling batch when either (a) latency scaling factor is > 1.7× (doubling batch took more than 1.7× longer — approaching linear) or (b) gain drops below 5% on two consecutive doublings. At that point you are memory-bandwidth-bound and larger batch will not help.
+
+**Note on threshold inconsistency:** `bench_compare.py` accepts at ≥ 3% improvement. The stop rule uses 5%. These are separate concerns: bench_compare decides commit/revert for that specific run; the stop rule decides whether to *continue doubling*. A 4% win at latency ratio 1.91× should be committed (bench_compare accepts it) but batch should not be doubled further (stop rule trips).
 
 **Disproven / Do Not Use:**
 
@@ -375,6 +419,9 @@ Use only when no code scan or profiler has surfaced a better hypothesis.
 | `--compilation-config '{"level":3}'` | Errors | `CompilationConfig` has no `level` field; CPU platform already enables torch.compile+inductor |
 | `OMP_NUM_THREADS=$(sysctl -n hw.physicalcpu)` | -2.3% | Hurts on M1 Pro; default threading better |
 | `--block-size 32` | -0.4% | ARM NEON optimal at default 16 (128-bit = 8×bf16) |
+| `inductor cpp.enable_concat_linear=true` | -4.6% + high p90/p99 variance | Causes mid-run recompilation artifacts on CPU; p90 +13%, p99 +18% |
+| Decode-only `req_indices` shortcut (skip `np.repeat` when `total_num_scheduled_tokens == num_reqs`) | -2.1% (noise) at batch=128 | Python overhead is <1% of step time at batch ≥ 128; change is correct but unmeasurable |
+| `--batch-size 512` | Do not try | Latency ratio already 1.91× at batch=256; linear or super-linear scaling guaranteed |
 
 **Stop condition (any one):**
 - `MAX_ITERS` (5) attempts completed
@@ -403,7 +450,7 @@ Replace `N` with the current iteration number.
 git diff vllm/   # confirm only intended lines changed
 ```
 
-### Step 3b — Smoke Test (mandatory for CodeEdit; recommended for Flag)
+### Step 3b — Smoke Test (mandatory for CodeEdit; recommended for Flag/InductorConfig)
 
 Run a single iteration with no output-json to verify the model still produces output and does not crash:
 
@@ -423,6 +470,7 @@ Run a single iteration with no output-json to verify the model still produces ou
 **Sanity-check the smoke-test latency against the baseline:**
 - `tokens/sec ≈ batch × output_len / latency_seconds`
 - If the smoke-test latency is **2× or more** than the baseline latency with the same batch+input+output, something is wrong (wrong input_len, wrong dtype, extra system load, OOM swap) — stop and investigate before running the full benchmark.
+- **InductorConfig fixes change the compile cache key.** The first smoke-test iteration will recompile, inflating latency by 10–30%. This is expected — do not abort. Proceed to the full benchmark (with `--num-iters-warmup 2`) which will stabilize after warmup. Only abort if the smoke-test latency is >2× the baseline *and* is unlikely to be explained by compile overhead (e.g., the run takes >3 minutes on a small model).
 
 If the smoke test crashes or produces a traceback → revert immediately, mark as miss:
 ```bash
@@ -487,20 +535,16 @@ and evaluate tokens_per_sec only. This is correct behavior — accept it.
 **If accepted (exit code 0):**
 
 ```bash
-# Record flag-only wins
-[ "<type>" = "flag" ] && \
-  echo "export VLLM_PERF_FLAGS='<accumulated winning flags>'" \
-    >> .cursor/skills/vllm-perf/winning_config.sh
-
 # Commit everything (results + code edits)
 git add perf_results/ docs/perf/
 # For CodeEdit, also stage the changed source file(s):
 # git add vllm/path/to/changed_file.py
 git commit -m "perf(cpu): <one-line fix description>
 
-type: <Flag|CodeEdit>
+type: <Flag|InductorConfig|CodeEdit>
 tokens/sec: {baseline_tps} → {candidate_tps} (+{delta}%)
 batch_size={N}, input_len=32, output_len=32"
+# NEVER add Co-authored-by, Assisted-by, or any AI attribution trailers to commits.
 
 COMMIT_SHA=$(git rev-parse --short HEAD)
 
@@ -508,8 +552,10 @@ COMMIT_SHA=$(git rev-parse --short HEAD)
 cp perf_results/candidate_N.json perf_results/baseline.json
 
 # Append to log
-# | N | <Flag/Code> | <fix description> | {tok/s} | +{delta}% | {SHA or N/A} |
+# | N | <Flag/InductorConfig/Code> | <fix description> | {tok/s} | +{delta}% | {SHA or N/A} |
 ```
+
+**Note:** `winning_config.sh` lives under `.cursor/` which is gitignored. Winning flags are reliably recorded only in `perf_results/run_log.jsonl` (which IS committed). Read the run log to reconstruct the winning invocation; do not rely on `winning_config.sh` across sessions.
 
 **If rejected (exit code 1):**
 
@@ -580,6 +626,7 @@ cat perf_results/prof_summary.txt
 ```bash
 git add docs/perf/cpu_opt_log.md
 git commit -m "perf(cpu): add optimization run log"
+# NEVER add Co-authored-by, Assisted-by, or any AI attribution trailers to commits.
 ```
 
 Report to the user:
@@ -602,7 +649,7 @@ git checkout main
 git branch -D perf/vllm-cpu-opt
 ```
 
-Flag wins are in `.cursor/skills/vllm-perf/winning_config.sh` — remove the line to drop a flag.
+Winning flags are recorded in `perf_results/run_log.jsonl` (committed). `winning_config.sh` is gitignored and may be stale — use the run log as the source of truth.
 
 ---
 
@@ -627,6 +674,8 @@ Read these when scanning for code-level optimizations:
 
 Record tested hypotheses here so future sessions don't repeat them.
 
+**Important:** this file is gitignored under `.cursor/`. Copy new rows into it at the end of every session. The machine-readable source of truth is `perf_results/run_log.jsonl` (committed).
+
 | Date | Fix | Result | Notes |
 |---|---|---|---|
 | 2026-05-09 | **dtype=float32 (from bf16)** | **+365.6% ✓** | M1 AMX has no native bf16 — scalar fallback 632× slower |
@@ -637,3 +686,7 @@ Record tested hypotheses here so future sessions don't repeat them.
 | 2026-05-09 | OMP_NUM_THREADS=8 | -2.3% ✗ | Hurts on M1 Pro (default threading better) |
 | 2026-05-09 | --block-size 32 | -0.4% ✗ | ARM NEON optimal at default 16 |
 | 2026-05-09 | copy_to_gpu identity guard | +0.5% ✗ | PyTorch CPU copy_(self) is internally near-free |
+| 2026-05-09 | **batch=128 (from 64)** | **+24.3% ✓** | Still strongly sublinear (1.62× latency at 2× batch); much larger than "diminishing returns" prediction |
+| 2026-05-09 | inductor cpp.enable_concat_linear=true | -4.6% ✗ | Causes mid-run recompilation bursts; p90 +13%, p99 +18%; avg tok/s regresses |
+| 2026-05-09 | decode req_indices shortcut (skip np.repeat when tokens==1) | -2.1% ✗ (noise) | Python overhead < 1% of step time at batch=128; model is compute-bound, no Python fix is measurable |
+| 2026-05-09 | **batch=256 (from 128)** | **+4.6% ✓** | Latency ratio 1.91× — above 1.7× stop threshold; batch scaling exhausted. Baseline now 463.6 tok/s. |
