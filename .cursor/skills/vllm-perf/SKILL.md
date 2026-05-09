@@ -12,17 +12,30 @@ Read and follow this skill when the user asks to:
 
 ## What This Skill Does
 
-This skill runs an autonomous optimization loop across three fix types:
+This skill runs an optimization loop that **improves the vLLM implementation** to squeeze more tokens/second out of the CPU path. There are three fix types, ordered by impact:
 
-- **CodeEdit** — targeted edits to vLLM Python source files (hot-path waste elimination, caching, kernel selection)
-- **InductorConfig** — `--compilation-config '{"inductor_compile_config": {...}}'` options that retune how torch inductor compiles the model
-- **Flag** — CLI flags, environment variables, scheduler knobs
+1. **CodeEdit** — the primary work. Targeted edits to vLLM source: attention kernels, linear layer dispatch, KV cache operations, operator fusion, quantization hooks. These are permanent improvements that hold at every batch size and compound with future changes.
+2. **InductorConfig** — `--compilation-config '{"inductor_compile_config": {...}}'` tweaks to how torch inductor compiles the model's forward pass.
+3. **Flag** — CLI flags, env vars, scheduler knobs. **Flag optimization is complete for this setup** (batch=256, float32 is the stable plateau). Do not revisit flags unless a code change invalidates the baseline.
 
-**Code fixes are the primary target.** Flag wins (especially batch scaling) are batch-size-specific: a +24% batch=128 win evaporates the moment someone runs at batch=8. A code fix improves efficiency at *every* batch size and compounds with future changes. The loop must be actively biased toward CodeEdit hypotheses; flags are used to establish a sane baseline and to fill iterations when the code scan surfaces nothing actionable.
+### Current optimization status
 
-**Critical limitation:** once the model is compute-bound (typically batch ≥ 128 with float32 on M1 Pro), Python/numpy overhead in `_prepare_inputs` drops below the 3% measurement noise floor. Empirically tested 2026-05: eliminating `np.repeat` for `req_indices` in the decode path gave -2.1% (noise). At that point, the only levers are larger batch (if still sublinear), quantization, or torch.compile changes to the compiled forward pass — not Python-level cleanup.
+Flag/batch tuning is exhausted as of 2026-05-09:
+- dtype=float32: mandatory on ARM (bfloat16 is 632× slower due to no AMX support)
+- batch=256: plateau (latency ratio 1.91× at 2× batch — memory-bandwidth bound)
+- All other flags tested and either regressed or below noise floor
 
-Both fix types follow the same measure-commit-or-revert discipline.
+**Sessions should start CodeEdit work directly.** Skip batch tuning entirely unless the profiler shows a new compute regime. The question is no longer "what flags to set" — it is "what in the vLLM implementation is leaving throughput on the table."
+
+### What "compute-bound" means for code targets
+
+At batch=256, float32, ~18s per iteration (32 decode steps), each decode step takes ~550ms. Model compute (matmuls, attention) dominates. This means:
+
+- **Python scheduling overhead** (`_prepare_inputs`, numpy allocations) is ~1% of wall time → **below measurement noise floor**. Do not target this layer. Empirically confirmed 2026-05.
+- **The compiled forward pass** (GEMM kernels, attention, KV cache reads) is the actual bottleneck. Code changes here are where gains live.
+- **Quantization** reduces weight memory traffic; on a memory-bandwidth-bound regime it directly reduces latency.
+
+Both CodeEdit and InductorConfig fixes follow the measure-commit-or-revert discipline.
 
 ---
 
@@ -52,16 +65,27 @@ On x86 with AVX-512 BF16 extension, bfloat16 is fine.
 ```
 MODEL              = Qwen/Qwen2.5-0.5B-Instruct
 DTYPE              = float32   # CRITICAL on ARM — see Platform Constraints
-BATCH_SIZE         = 8         # starting point; may grow as optimizations accumulate
-INPUT_LEN          = 32        # keeps each benchmark iter under 2 min on CPU
+BATCH_SIZE         = 256       # stable plateau — do NOT change without profiler evidence
+INPUT_LEN          = 32        # keeps each benchmark iter ~90s on CPU at batch=256
 OUTPUT_LEN         = 32        # same reason
-GPU_MEM_UTIL       = 0.3       # CRITICAL: default 0.92 OOMs on 16 GB Mac with ~5 GB free
+KV_CACHE_SPACE     = 1         # GiB — set via VLLM_CPU_KVCACHE_SPACE=1 env var
+                               # Bypasses the gpu_memory_utilization formula entirely.
+                               # Formula: kv_cache = total×util − model_rss → goes negative
+                               # when model_rss > total×util (float32 model ≈ 3.2 GB in-process).
+                               # Use VLLM_CPU_KVCACHE_SPACE=1 in ALL bench commands instead of
+                               # --gpu-memory-utilization. 1 GiB >> 32 MB needed at batch=256.
+GPU_MEM_UTIL       = 0.3       # DEPRECATED for benchmarking — kept for reference only.
+                               # Use KV_CACHE_SPACE above. --gpu-memory-utilization 0.3 fails
+                               # whenever system free RAM < 4.8 GB (Cursor + OS + model use ~11+ GB).
 MAX_ITERS          = 5
 RESULTS_DIR        = perf_results   # workspace-relative — survives reboots
 BRANCH             = perf/vllm-cpu-opt
 LOG_FILE           = docs/perf/cpu_opt_log.md
 SKILL_DIR          = .cursor/skills/vllm-perf
 ```
+
+**Stable baseline (as of 2026-05-09):** 463.6 tok/s at batch=256, float32, in=32, out=32.
+If `perf_results/baseline.json` shows a higher number, use that — it means a prior session landed a code improvement.
 
 **tokens/sec formula (the only valid cross-run metric):**
 ```
@@ -110,18 +134,38 @@ else:
     print('Downloaded.')
 "
 
-# 6. Check RAM + CPU arch
+# 6. Check RAM + CPU arch + memory pressure
 .venv/bin/python -c "
-import subprocess, platform
-mem_gb = int(subprocess.check_output(['sysctl','-n','hw.memsize']).strip()) / 1024**3
-util = min(0.4, 4.0 / mem_gb)
+import subprocess, platform, os
+
 arch = platform.machine()
-print(f'CPU: {arch}, RAM: {mem_gb:.0f} GB')
-print(f'Suggested --gpu-memory-utilization {util:.2f}')
+total_gb = int(subprocess.check_output(['sysctl','-n','hw.memsize']).strip()) / 1024**3
+
+# macOS available memory: free + inactive pages
+vm = subprocess.check_output(['vm_stat']).decode()
+page = 4096
+free = inactive = 0
+for line in vm.splitlines():
+    if 'Pages free' in line: free = int(line.split(':')[1].strip().rstrip('.'))
+    if 'Pages inactive' in line: inactive = int(line.split(':')[1].strip().rstrip('.'))
+avail_gb = (free + inactive) * page / 1024**3
+
+print(f'CPU: {arch}, Total RAM: {total_gb:.0f} GB, Available: {avail_gb:.1f} GB')
 if arch == 'arm64':
     print('ARM detected → MUST use --dtype float32 (bf16 has no AMX support)')
 else:
     print('x86 detected → bf16 OK if AVX-512 BF16 extension present')
+
+# Memory check for benchmark viability
+if avail_gb < 5.0:
+    print()
+    print('WARNING: Available RAM < 5 GB. --gpu-memory-utilization 0.3 WILL FAIL.')
+    print('  The formula (total×util - model_rss) goes negative when model_rss > 3.2 GB.')
+    print('  USE: VLLM_CPU_KVCACHE_SPACE=1 (no --gpu-memory-utilization flag)')
+    print('  This sets explicit 1 GiB KV cache, bypassing the formula entirely.')
+    print('  1 GiB >> 32 MB needed at batch=256 — no throughput impact.')
+else:
+    print(f'RAM OK: {avail_gb:.1f} GB free — VLLM_CPU_KVCACHE_SPACE=1 still recommended (more robust)')
 "
 
 # 7. Optimization branch (all changes land here)
@@ -218,11 +262,12 @@ with the correct parameters. Never carry forward a stale or mislabeled baseline.
 ```bash
 # Step 1a: benchmark
 # Use .venv/bin/vllm bench latency — NOT python -m (no __main__, produces nothing)
-.venv/bin/vllm bench latency \
+# VLLM_CPU_KVCACHE_SPACE=1 sets explicit 1 GiB KV cache, bypassing the
+# gpu_memory_utilization formula that fails when system RAM < 5 GB free.
+VLLM_CPU_KVCACHE_SPACE=1 .venv/bin/vllm bench latency \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --dtype float32 \
-  --gpu-memory-utilization 0.3 \
-  --batch-size 8 \
+  --batch-size 256 \
   --input-len 32 \
   --output-len 32 \
   --num-iters-warmup 2 \
@@ -232,21 +277,21 @@ with the correct parameters. Never carry forward a stale or mislabeled baseline.
 # Step 1b: enrich (always pass --input-len and --output-len — raw JSON omits both)
 .venv/bin/python .cursor/skills/vllm-perf/bench_compare.py \
   --wrap perf_results/baseline_raw.json \
-  --batch-size 8 \
+  --batch-size 256 \
   --input-len 32 \
   --output-len 32 \
-  --label "baseline: float32, batch=8, in=32, out=32" \
+  --label "baseline: float32, batch=256, in=32, out=32" \
   --save perf_results/baseline.json \
   --append-log perf_results/run_log.jsonl
 ```
 
 Read the printed `tokens_per_sec`. Append to log:
 ```
-| 0 | flag | Baseline (float32, batch=8) | {tok/s} | — | N/A |
+| 0 | flag | Baseline (float32, batch=256) | {tok/s} | — | N/A |
 ```
 
-**Expected runtime:** ~30s for warmup + 5 iters at batch=8 with float32 on M1.
-If this takes >2 minutes, something is wrong — likely wrong dtype. Stop and investigate.
+**Expected baseline:** ~463 tok/s. If significantly lower (< 420), check for background load or wrong dtype.
+**Expected runtime:** ~90s for warmup + 5 iters at batch=256 with float32 on M1.
 
 ---
 
@@ -254,181 +299,159 @@ If this takes >2 minutes, something is wrong — likely wrong dtype. Stop and in
 
 **This is the core intelligence step. Run it before EVERY iteration.**
 
-You are an AI agent with code access, profiling data, and run history. Your job is to find the highest-impact untried fix — **with a strong prior toward CodeEdit**. A code fix that eliminates 5% of decode-step overhead is worth more than a batch-size tweak that only holds at one specific batch size.
+You are working on improving the vLLM implementation. Flag tuning is done. Your job is to find code-level changes to the compiled forward pass — attention, linear layers, KV cache operations — that reduce the per-token compute cost.
 
 ### Step 2a — Read the Evidence
 
 ```bash
-# Run history
+# Run history — check what has been tried and what each result ruled out
 cat perf_results/run_log.jsonl 2>/dev/null || echo "(no runs yet)"
 
-# Profiler summary (if captured)
-cat perf_results/prof_summary.txt 2>/dev/null || echo "(no profile yet)"
+# Profiler summary — the most valuable input for hypothesis generation
+cat perf_results/prof_summary.txt 2>/dev/null || echo "(no profile yet — run Phase 4 before iteration 1)"
 ```
 
-### Step 2b — Code Scan (mandatory EVERY iteration, not just from iteration 3)
+**If no profiler data exists yet, run Phase 4 first. This is a hard rule, not a suggestion.**
 
-Read these files looking for hot-path waste. Skim for the anti-patterns listed below.
+Empirical lesson (2026-05): two sessions skipped the profiler and went straight to catalog hypotheses. Both misses. The catalog items `max_autotune_gemm_backends=AT_BLAS` (+2.2%) and `cpp.simdlen=256` (+0.7%) produced sub-threshold results because we had no profiler evidence that GEMM dispatch was the actual bottleneck. The profiler is the only way to know which op to target. **STOP. Do not proceed to Step 2d until `perf_results/prof_summary.txt` exists and has been read.**
 
-**Files to read:**
-- `vllm/v1/worker/gpu_model_runner.py` — the inherited forward loop CPU runs through
-- `vllm/v1/worker/cpu_model_runner.py` — CPU-specific overrides
-- `vllm/v1/utils.py` — `CpuGpuBuffer` definition
-- `vllm/v1/core/sched/scheduler.py` — per-step scheduling overhead
-- `vllm/platforms/cpu.py` — CPU platform knobs and constraints
+### Step 2b — Forward-Pass Code Scan
 
-**Anti-patterns to look for (with search commands):**
+Scan the compiled forward path. At batch=256, the bottleneck is in GEMM and attention — not in Python scheduling.
+
+**Primary scan targets:**
 
 ```bash
-# 1. Self-copies: copy_to_gpu() after _postprocess_tensors sets .gpu = .cpu
-#    NOTE: Empirically tested (2026-05): gain was only +0.5% (noise floor).
-#    PyTorch CPU copy_() on self is internally near-free. Skip this hypothesis
-#    unless profiler shows aten::copy_ > 15% of wall time.
-grep -n "copy_to_gpu\|copy_to_cpu" vllm/v1/worker/gpu_model_runner.py
+# 1. Attention backend — how decode attention is implemented for CPU
+# NOTE: path is vllm/v1/attention/backends/ — NOT vllm/attention/backends/ (doesn't exist)
+ls vllm/v1/attention/backends/
+grep -rn "class.*Backend\|def forward" vllm/v1/attention/backends/ | grep -v test | head -30
 
-# 2. Per-step numpy allocations: np.repeat / np.cumsum / torch.from_numpy
-#    During pure decode (all batch=N, output 1 token each), many of these arrays
-#    are identical step-to-step and could be cached or avoided.
-grep -n "np\.repeat\|np\.cumsum\|torch\.from_numpy\|np\.array(" \
-  vllm/v1/worker/gpu_model_runner.py
+# 2. Which attention backend is actually selected for CPU
+grep -n "get_attn_backend\|_attn_backend\|attention_backend\|CPU_ATTN" vllm/platforms/cpu.py
+grep -n "CPU_ATTN\|get_attn_backend_cls" vllm/v1/attention/backends/registry.py 2>/dev/null | head -10
 
-# 3. Per-step Python loops over requests
-grep -n "for req\|for i in range(num_reqs\|for req_id in" \
-  vllm/v1/worker/gpu_model_runner.py | head -30
+# 3. Linear layer dispatch — is the optimal GEMM path selected?
+grep -n "def forward\|F\.linear\|torch\.mm\|torch\.matmul\|aten::mm" \
+  vllm/model_executor/layers/linear.py | head -30
 
-# 4. Unnecessary .to(device) on tensors already on the right device
-grep -n "\.to(self\.device\|\.to(\"cpu\"\|\.to(device" \
-  vllm/v1/worker/gpu_model_runner.py | head -30
+# 4. KV cache operations — how keys/values are written and read each step
+grep -rn "def forward\|cache_k\|cache_v\|kv_cache\|paged_attn" \
+  vllm/v1/attention/backends/ | grep -v test | head -30
 
-# 5. Dead branches guarded by flags already False on CPU
-grep -n "use_cuda_graph\|cascade_attn" vllm/v1/worker/gpu_model_runner.py | head -20
+# 5. Inductor config currently active — what's already enabled
+grep -n "inductor_compile_config\|epilogue_fusion\|cpp\." vllm/platforms/cpu.py | head -20
 
-# 6. Redundant .contiguous() or .clone() in the forward path
-grep -n "\.contiguous()\|\.clone()" vllm/v1/worker/gpu_model_runner.py | head -20
+# 6. Quantization availability — is AWQ/INT8 usable on CPU?
+cat vllm/model_executor/layers/quantization/cpu_wna16.py 2>/dev/null | head -40
+grep -rn "is_cpu\|cpu.*quant\|quant.*cpu" vllm/model_executor/layers/quantization/ \
+  --include="*.py" | grep -v test | head -20
 ```
 
-For any hit, read ±20 lines of context to understand whether it's in the hot path (called every step) and whether it's safe to change.
+**For each hit, read ±30 lines of context** to understand: (a) is this in the decode hot path? (b) is there a more efficient alternative that works on CPU/ARM?
 
 ### Step 2c — Reason Explicitly
 
-Answer these questions out loud before proposing hypotheses:
+Answer these before proposing hypotheses:
 
-1. **Is the baseline configuration sane?**
-   - Correct dtype for this CPU architecture? (fp32 on ARM, bf16 OK on x86+AVX-512 BF16)
-   - Reasonable batch size? (CPU can usually handle larger batches than GPU for small models)
-   - Any red flags in the benchmark output? (unexpectedly slow warmup, OOM warnings)
-   - *If dtype or starting batch size is wrong, fix that first — these are prerequisite, not optimizations.*
+1. **What does the profiler say dominates?** (If no profiler data: run Phase 4 now, before hypothesizing.)
+   - `aten::mm` / `aten::linear` > 60%: GEMM-bound → quantization, better kernel dispatch
+   - `aten::scaled_dot_product_attention` > 30%: attention-bound → block size, flash attention path
+   - `aten::index_put` / `aten::copy_` > 15%: KV cache write bound → layout or fused kernel
+   - `aten::index` / `aten::gather` > 10%: KV cache read bound → investigate paged attention path
 
-2. **What did the code scan surface?**
-   - Is there per-step work that is repeated identically every decode step and could be cached or eliminated?
-   - Are there Python-level loops, allocations, or function calls whose cost scales with batch or seq-len but add no arithmetic value?
-   - Is there dead-branch overhead (cuda_graph checks, cascade_attn loops) that executes every step but always resolves the same way?
-   - **Rate each hit: "hot path + safe to change" → CodeEdit hypothesis. "cold path or risky" → skip.**
+2. **Which attention backend is active?** Check `vllm/platforms/cpu.py`.
+   - Is it `TorchSDPABackend` (generic torch)? A CPU-optimized backend might exist.
+   - Is IPEX available? Intel Extension for PyTorch has CPU-specific optimized attention.
+   - Is the attention running MHA or GQA? Qwen2.5-0.5B uses GQA (14 heads, 2 KV heads) — verify the backend handles this efficiently.
 
-3. **What does current tokens/sec tell us?**
-   - Strongly sublinear batch scaling (latency factor < 1.5× when batch doubles): compute underutilized, batch increase is still valid *but only after this session's code hypotheses are tried*
-   - Plateau or near-linear scaling: memory-bandwidth-bound, batch scaling is done; code or quantization only
-   - Token/sec flat despite config changes: bottleneck is definitely in the compiled hot path — profile before guessing
+3. **Is weight quantization viable?**
+   - Weight-only INT8 (AWQ/GPTQ) halves the weight memory read per matmul. At batch=256, if `aten::mm` dominates and the model is memory-bandwidth-bound (verified by latency ratio 1.91× at batch doubling), quantization directly reduces the bottleneck.
+   - Check `vllm/model_executor/layers/quantization/cpu_wna16.py` — does it support Qwen2.5?
 
-4. **Is the model compute-bound? (Critical for CodeEdit viability)**
+4. **What inductor options haven't been tried?**
+   - `cpp.simdlen` and `max_autotune_gemm_backends=AT_BLAS`: **both empirically tested and rejected** (2026-05). AT_BLAS gave +2.2% (below 3% threshold); simdlen=256 gave +0.7%. LLVM already auto-vectorizes ARM NEON well; neither option meaningfully changes the compiled kernels. Do not re-try unless the profiler shows a new kernel pattern.
+   - **Combination** of AT_BLAS + simdlen=256: not yet tested. AT_BLAS showed consistent latency improvement on ALL percentiles (p99 −3.6%). If you need to try one more InductorConfig option, try the combo: `{"max_autotune_gemm_backends": "AT_BLAS", "cpp.simdlen": 256}`. Low confidence (<3% expected) but the only untried combination.
+   - `freezing`: allows torch.compile to treat model weights as constants, enabling more aggressive kernel fusion. This is a top-level torch.compile argument, not an inductor config key — check if vLLM exposes it.
 
-   Estimate Python overhead fraction before proposing Python-level code fixes:
-   ```
-   step_latency_s   = avg_latency_s / output_len          # e.g. 9.24s / 32 = 0.29s/step
-   python_overhead  = ~1–5 ms/step (rough upper bound for _prepare_inputs at any batch)
-   overhead_pct     = python_overhead / step_latency_s     # e.g. 3ms / 290ms = ~1%
-   ```
-   - If `overhead_pct < 3%` → Python-level code fixes will be **below the measurement noise floor**. Still satisfy the batch-scaling gate by attempting one, but set expectation to miss and move on.
-   - If `overhead_pct ≥ 10%` → Python cleanup is worth pursuing seriously.
-   - Empirical threshold: at batch ≥ 128 with float32 on M1 Pro, overhead_pct ≈ 1% → noise floor.
-   - At batch ≤ 16, overhead_pct can be 10-30% and code fixes are worth prioritizing.
-
-5. **What does the profiler show (if captured)?**
-   - Which op dominates? Use the bottleneck → hypothesis table in Phase 4.
-   - Are there surprising ops (unexpected copies, fallback kernels)?
-
-6. **What did previous iterations reveal?**
-   - Which bottleneck did each accepted fix relieve?
-   - What does each rejected fix rule out?
-   - **Have at least 2 code fix hypotheses been tested this session? If not, why not?**
+5. **What did previous iterations reveal?**
+   - Which bottleneck did each accepted fix remove?
+   - Which hypothesis type was NOT yet tried this session?
 
 ### Step 2d — Generate Ranked Hypotheses
 
-Produce 3–5 hypotheses. **At least 2 must be CodeEdit or InductorConfig type.** If the code scan found nothing actionable, explain why (with file + line evidence), then and only then may you fill all slots with Flag hypotheses.
+Produce 3–5 hypotheses. **All must be CodeEdit or InductorConfig.** Flags are exhausted — if you find yourself proposing a flag change, stop and re-examine the code scan.
 
 ```
 Hypothesis N: <name>
-  Type      : Flag | EnvVar | InductorConfig | CodeEdit
-  Mechanism : WHY this increases tokens/sec — which bottleneck it removes
-  Evidence  : what in profiler / code scan / run log supports this
-  Fix       : exact flag/env-var/config-json OR file:line with specific change described
+  Type      : InductorConfig | CodeEdit
+  Mechanism : WHY this increases tokens/sec — which specific op or bottleneck it addresses
+  Evidence  : profiler data / code scan file:line / logical argument
+  Fix       : file:line with specific change, OR exact inductor_compile_config JSON
   Est. gain : % estimate + confidence: low / medium / high
-  Risk      : what could break; how to verify correctness
+  Risk      : what could break; how to verify correctness after change
 ```
 
 ### Step 2e — Select
 
 ```
 SELECTED: Hypothesis N — <name>
-TYPE    : Flag | EnvVar | InductorConfig | CodeEdit
-REASON  : <one sentence from evidence above>
+TYPE    : InductorConfig | CodeEdit
+REASON  : <one sentence tying the hypothesis to profiler or code evidence>
 ```
 
-**Selection tiebreaker:** if a CodeEdit hypothesis and a Flag hypothesis have estimated gains within 2× of each other, **select the CodeEdit**. Flag wins are batch-size-specific and evaporate when batch changes; a code fix improves efficiency at every batch size. The only exception is when the flag fixes a correctness prerequisite (dtype, starting batch, OOM avoidance).
+**Default choice: the hypothesis most directly targeting the op that dominated the profiler output.** If two hypotheses target the same bottleneck, prefer the one that's lower-risk (smaller diff, easier to verify).
 
-**Batch-scaling gate:** once the run log shows 2 or more accepted batch-scaling wins (regardless of iteration number), the next iteration MUST be a CodeEdit or InductorConfig attempt. Only return to batch scaling after a code-level attempt has been tried.
+**Do not select Flag hypotheses.** If the profiler is unavailable and the code scan found nothing, the right action is to run Phase 4 — not to reach for a flag.
 
-**Noise-floor exception:** when Step 2c question 4 shows `overhead_pct < 3%`, the code attempt will almost certainly miss. Attempt it anyway to satisfy the gate, but explicitly state in the hypothesis: "Expected result: miss (noise floor — model is compute-bound). Purpose: satisfy batch-scaling gate." This prevents wasted deliberation about *why* it missed.
+### Code Hypothesis Seed Catalog
 
-### Fallback Seed Catalog
+Use when the code scan didn't surface an obvious target. Listed by the profiler op they address.
 
-Use only when the code scan and profiler have both been read and nothing actionable was found. Explain why each code anti-pattern from Step 2b was rejected before falling back here.
-
-**Code-first seeds** (try these before any batch scaling beyond the initial baseline):
-
-⚠️ **All priorities 1–4 operate on Python-level arrays of size `num_reqs`. At batch ≥ 128 with float32 on M1 Pro, these are ALL below the measurement noise floor (~1% overhead). Only pursue them seriously at batch ≤ 16 where Python overhead can reach 10–30% of step time.**
+**If `aten::mm` / `aten::linear` dominates (GEMM-bound):**
 
 | Priority | Type | Fix | Notes |
 |---|---|---|---|
-| 1 | CodeEdit | Cache decode-step arrays in `_prepare_inputs` | During pure decode, `np.repeat(arange[:num_reqs], [1,1,...,1])`, `np.cumsum`, and `query_pos` are constant step-to-step — cache after first decode step. **Below noise floor at batch ≥ 128.** |
-| 2 | CodeEdit | Hoist dead `if self.use_cuda_graph:` branches | Always False on CPU; pure Python overhead every step. `CPUModelRunner` sets `self.use_cuda_graph = False` at init. **Below noise floor at batch ≥ 128.** |
-| 3 | CodeEdit | Skip `_compute_cascade_attn_prefix_lens` when `num_common_prefix_blocks` all-zero | **NOT applicable on CPU** — `CPUModelRunner.__init__` sets `self.cascade_attn_enabled = False`, so the call at line ~3949 is gated by `if self.cascade_attn_enabled` and never executes. |
-| 4 | CodeEdit | Inline `_get_cumsum_and_arange` for the all-ones decode case | `np.repeat(arange[:N], [1,1,...,1])` is just `arange[:N]`; skip repeat when `total_num_scheduled_tokens == num_reqs`. **Empirically tested 2026-05 at batch=128: -2.1% (noise).** |
+| 1 | CodeEdit | Enable weight-only INT8 quantization (AWQ CPU) | `cpu_wna16.py` implements CPU WNA16; check if Qwen2.5-0.5B has a compatible quantized checkpoint or can be quantized via `llm-compressor`. Halves weight memory → direct bandwidth reduction. |
+| 2 | CodeEdit | Verify MergedColumnParallelLinear fuses QKV projection | `vllm/model_executor/layers/linear.py`: if QKV is fused into one matmul, check that the fused path is active on CPU and not falling back to 3 separate GEMMs. |
+| 3 | InductorConfig | `{"max_autotune_gemm_backends": "AT_BLAS", "cpp.simdlen": 256}` (combo) | Individual options both tested and missed. Try the combo only if out of other ideas. Expected <3%, low confidence. |
 
-**Flag seeds** (use after attempting at least 1 code fix, or when code scan is conclusively empty):
+**If `aten::scaled_dot_product_attention` dominates (attention-bound):**
 
 | Priority | Type | Fix | Notes |
 |---|---|---|---|
-| 5 | Flag | `--batch-size 16` | CPU usually underutilized at small batch |
-| 6 | Flag | `--batch-size 32` | Continue if batch×2 showed sublinear latency scaling (gain > 5%) |
-| 7 | Flag | `--batch-size 64` | Continue if still sublinear; watch for OOM |
-| 8 | Flag | `--batch-size 128` | Continue if still sublinear; +24% observed at this step in practice |
-| 9 | Flag | `--batch-size 256` | Diminishing returns — +4.6% observed, latency ratio 1.91× (above 1.7× stop threshold). Barely passes bench_compare 3% but trips the stop rule. |
-| 10 | Flag | `--no-enable-chunked-prefill` | Marginal gain at in=32; only try after code fixes stall |
+| 5 | CodeEdit | Check IPEX attention backend | `vllm/attention/backends/ipex_attn.py` — if Intel IPEX is installed, it provides optimized CPU attention. Check if it's selectable for ARM via `vllm/platforms/cpu.py`. |
+| 6 | CodeEdit | Verify GQA is dispatched efficiently | Qwen2.5-0.5B has 2 KV heads vs 14 Q heads. Check the active attention backend's GQA path — some backends fall back to expanded KV (repeat_kv) which doubles KV memory reads. |
+| 7 | InductorConfig | `"triton.cudagraphs": false` | Explicit disable to remove any graph-capture overhead on CPU (should already be disabled but verify). |
 
-**Batch scaling stop rule:** stop doubling batch when either (a) latency scaling factor is > 1.7× (doubling batch took more than 1.7× longer — approaching linear) or (b) gain drops below 5% on two consecutive doublings. At that point you are memory-bandwidth-bound and larger batch will not help.
+**If `aten::index_put_` / KV cache write dominates:**
 
-**Note on threshold inconsistency:** `bench_compare.py` accepts at ≥ 3% improvement. The stop rule uses 5%. These are separate concerns: bench_compare decides commit/revert for that specific run; the stop rule decides whether to *continue doubling*. A 4% win at latency ratio 1.91× should be committed (bench_compare accepts it) but batch should not be doubled further (stop rule trips).
+| Priority | Type | Fix | Notes |
+|---|---|---|---|
+| 8 | CodeEdit | Investigate slot mapping kernel | `vllm/v1/worker/block_table.py` — `CPUModelRunner._postprocess_triton()` replaces the slot mapping with a CPU Triton kernel. Check `vllm/utils/cpu_triton_utils.py` for optimization opportunities. |
+| 9 | CodeEdit | KV cache block size | Default is 16 tokens/block. A larger block reduces the number of scattered writes. Try `--block-size 32` only if profiler shows index_put dominates (previously tested at -0.4% when GEMM-bound — only revisit if regime changes). |
 
-**Disproven / Do Not Use:**
+**Do Not Use (disproven):**
 
 | Fix | Result | Why |
 |---|---|---|
 | `--dtype bfloat16` on ARM | **632× slower matmul** | M1/M2/M3/M4 AMX has no native bf16 compute |
-| `copy_to_gpu()` identity guard | +0.5% (noise) | PyTorch CPU `copy_(self)` is internally near-free |
-| `--compilation-config '{"level":3}'` | Errors | `CompilationConfig` has no `level` field; CPU platform already enables torch.compile+inductor |
+| `--batch-size > 256` | Do not try | Latency ratio 1.91× at batch=256; linear scaling at larger batch |
 | `OMP_NUM_THREADS=$(sysctl -n hw.physicalcpu)` | -2.3% | Hurts on M1 Pro; default threading better |
-| `--block-size 32` | -0.4% | ARM NEON optimal at default 16 (128-bit = 8×bf16) |
-| `inductor cpp.enable_concat_linear=true` | -4.6% + high p90/p99 variance | Causes mid-run recompilation artifacts on CPU; p90 +13%, p99 +18% |
-| Decode-only `req_indices` shortcut (skip `np.repeat` when `total_num_scheduled_tokens == num_reqs`) | -2.1% (noise) at batch=128 | Python overhead is <1% of step time at batch ≥ 128; change is correct but unmeasurable |
-| `--batch-size 512` | Do not try | Latency ratio already 1.91× at batch=256; linear or super-linear scaling guaranteed |
+| `--block-size 32` | -0.4% (when GEMM-bound) | Only re-evaluate if profiler shifts to KV-write-bound |
+| `inductor cpp.enable_concat_linear=true` | -4.6% + p90/p99 variance | Mid-run recompilation artifacts |
+| Any Python scheduling change (`_prepare_inputs`, `np.repeat`, etc.) | -2.1% (noise) | Python overhead < 1% of step time at batch=256 |
+| `copy_to_gpu()` identity guard | +0.5% (noise) | CPU `copy_(self)` is internally near-free |
+| `--compilation-config '{"level":3}'` | Errors | No `level` field in CompilationConfig |
+| `inductor max_autotune_gemm_backends=AT_BLAS` (alone) | +2.2% (below 3%) | Sub-threshold; LLVM already dispatches to Accelerate BLAS on ARM. All percentiles improved directionally (p99 −3.6%) but avg tok/s below acceptance bar. |
+| `inductor cpp.simdlen=256` (alone) | +0.7% (noise) | LLVM auto-vectorization already handles NEON widths optimally; explicit hint adds no measurable gain. |
 
 **Stop condition (any one):**
 - `MAX_ITERS` (5) attempts completed
-- 2 consecutive iterations gained < 3%
-- All hypotheses exhausted
+- 2 consecutive misses with no new profiler evidence
+- All catalog hypotheses exhausted
 
-If stopped and tokens/sec is still unsatisfying → run Phase 4 (profiling) to gather new evidence, then return to Phase 2.
+When stalled: run Phase 4, then return to Phase 2 with the new profiler data.
 
 ---
 
@@ -455,22 +478,20 @@ git diff vllm/   # confirm only intended lines changed
 Run a single iteration with no output-json to verify the model still produces output and does not crash:
 
 ```bash
-.venv/bin/vllm bench latency \
+VLLM_CPU_KVCACHE_SPACE=1 .venv/bin/vllm bench latency \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --dtype float32 \
-  --gpu-memory-utilization 0.3 \
-  --batch-size 8 \
+  --batch-size 256 \
   --input-len 32 \
   --output-len 32 \
   --num-iters-warmup 0 \
-  --num-iters 1 \
-  <extra-flags-if-flag-fix>
+  --num-iters 1
 ```
 
 **Sanity-check the smoke-test latency against the baseline:**
-- `tokens/sec ≈ batch × output_len / latency_seconds`
-- If the smoke-test latency is **2× or more** than the baseline latency with the same batch+input+output, something is wrong (wrong input_len, wrong dtype, extra system load, OOM swap) — stop and investigate before running the full benchmark.
-- **InductorConfig fixes change the compile cache key.** The first smoke-test iteration will recompile, inflating latency by 10–30%. This is expected — do not abort. Proceed to the full benchmark (with `--num-iters-warmup 2`) which will stabilize after warmup. Only abort if the smoke-test latency is >2× the baseline *and* is unlikely to be explained by compile overhead (e.g., the run takes >3 minutes on a small model).
+- `tokens/sec ≈ batch × output_len / latency_seconds` — expect ~400-500 tok/s warmed
+- Cold single-iter at batch=256 typically runs ~20s (no warmup). If >60s, something is wrong.
+- **InductorConfig fixes change the compile cache key.** The first smoke-test iteration will recompile, inflating latency by 10–30%. This is expected — do not abort. Proceed to the full benchmark (with `--num-iters-warmup 2`) which will stabilize after warmup. Only abort if the smoke-test latency is >2× the baseline *and* is unlikely to be explained by compile overhead.
 
 If the smoke test crashes or produces a traceback → revert immediately, mark as miss:
 ```bash
@@ -485,18 +506,14 @@ current `baseline.json`. If you changed batch size or dtype as the candidate fix
 fine — but record the change explicitly.
 
 **Expected runtimes (float32, M1 Pro):**
-- batch=8:  ~10s for warmup+5iters
-- batch=32: ~40s
-- batch=64: ~30s (yes, faster than batch=32 at bf16; that's the fp32 speedup)
-- batch=128: ~60s
+- batch=256: ~90s for warmup+5iters (2 warmup × ~18s + 5 bench × ~18s = ~126s total)
 
-If a run takes >3× the expected time, stop and investigate — likely wrong dtype.
+If a run takes >3× the expected time (~4.5 min), stop and investigate — likely wrong dtype or recompile triggered by an InductorConfig change (expected on first run; subsequent warmup iters stabilize).
 
 ```bash
-.venv/bin/vllm bench latency \
+VLLM_CPU_KVCACHE_SPACE=1 .venv/bin/vllm bench latency \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --dtype float32 \
-  --gpu-memory-utilization 0.3 \
   --batch-size <BATCH_SIZE_USED> \
   --input-len 32 \
   --output-len 32 \
@@ -590,7 +607,7 @@ mkdir -p perf_results/prof
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --device cpu \
   --dtype float32 \
-  --batch-size 8 \
+  --batch-size 256 \
   --input-len 32 \
   --output-len 32 \
   --num-iters-warmup 2 \
@@ -655,18 +672,23 @@ Winning flags are recorded in `perf_results/run_log.jsonl` (committed). `winning
 
 ## Key Source Files
 
-Read these when scanning for code-level optimizations:
-
 | File | What to look for |
 |---|---|
-| `vllm/v1/worker/gpu_model_runner.py` | `np.repeat`/`from_numpy` per step, per-request Python loops, `.to(device)` calls |
-| `vllm/v1/worker/cpu_model_runner.py` | CPU-specific overrides; check what the parent still runs that may be wasteful |
-| `vllm/v1/utils.py` | `CpuGpuBuffer` — `copy_to_gpu()` implementation (empirically cheap on CPU) |
-| `vllm/v1/core/sched/scheduler.py` | Per-step Python object creation, list builds, dict lookups in the decode loop |
-| `vllm/platforms/cpu.py` | Platform knobs, dtype support, block size defaults, compilation mode setup |
-| `vllm/model_executor/layers/quantization/cpu_wna16.py` | AWQ CPU quant availability |
-| `tools/profiler/print_layerwise_table.py` | Profiler output analysis |
+| `vllm/platforms/cpu.py` | Attention backend selection, dtype constraints, inductor config, compilation mode |
+| `vllm/attention/backends/` | All attention backend implementations — find which one runs on CPU |
+| `vllm/attention/layer.py` | Backend dispatch logic — how the active backend is chosen at runtime |
+| `vllm/model_executor/layers/linear.py` | Linear layer forward; QKV fusion; which GEMM path is dispatched |
+| `vllm/model_executor/layers/attention/` | Attention layer wrappers; GQA expand path |
+| `vllm/model_executor/layers/quantization/cpu_wna16.py` | CPU WNA16 (AWQ) quantization implementation |
+| `vllm/v1/worker/cpu_model_runner.py` | CPU-specific runner overrides; `_postprocess_triton()` for custom kernels |
+| `vllm/utils/cpu_triton_utils.py` | CPU Triton kernel implementations (slot mapping, spec-decode helpers) |
+| `tools/profiler/print_layerwise_table.py` | Profiler output analysis — **read this output before every hypothesis** |
 | `.cursor/skills/vllm-perf/bench_compare.py` | This skill's benchmark harness |
+
+**Do NOT spend time scanning these for new opportunities** (all confirmed below noise floor):
+- `vllm/v1/worker/gpu_model_runner.py` — Python scheduling overhead < 1% of step time at batch=256
+- `vllm/v1/core/sched/scheduler.py` — same
+- `vllm/v1/utils.py` — `copy_to_gpu()` is a self-copy, internally free
 
 ---
 
@@ -675,6 +697,8 @@ Read these when scanning for code-level optimizations:
 Record tested hypotheses here so future sessions don't repeat them.
 
 **Important:** this file is gitignored under `.cursor/`. Copy new rows into it at the end of every session. The machine-readable source of truth is `perf_results/run_log.jsonl` (committed).
+
+**Sub-threshold signal convention:** if a fix improved ALL latency percentiles but tok/s stayed below 3%, mark it `~+N% (sub-threshold)`. Do not re-run the same fix alone; it is a candidate for combination only.
 
 | Date | Fix | Result | Notes |
 |---|---|---|---|
@@ -690,3 +714,5 @@ Record tested hypotheses here so future sessions don't repeat them.
 | 2026-05-09 | inductor cpp.enable_concat_linear=true | -4.6% ✗ | Causes mid-run recompilation bursts; p90 +13%, p99 +18%; avg tok/s regresses |
 | 2026-05-09 | decode req_indices shortcut (skip np.repeat when tokens==1) | -2.1% ✗ (noise) | Python overhead < 1% of step time at batch=128; model is compute-bound, no Python fix is measurable |
 | 2026-05-09 | **batch=256 (from 128)** | **+4.6% ✓** | Latency ratio 1.91× — above 1.7× stop threshold; batch scaling exhausted. Baseline now 463.6 tok/s. |
+| 2026-05-09 | inductor max_autotune_gemm_backends=AT_BLAS | ~+2.2% (sub-threshold) | All percentiles improved (p50 −2.8%, p90 −3.0%, p99 −3.6%). Below 3% tok/s bar. Ran without profiler evidence — lesson: run Phase 4 first. |
+| 2026-05-09 | inductor cpp.simdlen=256 | +0.7% ✗ (noise) | LLVM auto-vectorization already optimal on ARM NEON. Ran without profiler evidence. |

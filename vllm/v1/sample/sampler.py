@@ -223,6 +223,10 @@ class Sampler(nn.Module):
         # Avoid division by zero if there are greedy requests.
         if not all_random:
             temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
+        # Fast path: skip the 156 MB read+write on [batch, vocab_size] when
+        # all temperatures are exactly 1.0 — division by 1.0 is a no-op.
+        if (temp == 1.0).all():
+            return logits
         return logits.div_(temp.unsqueeze(dim=1))
 
     @staticmethod

@@ -1,0 +1,56 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                               aten::mm        26.10%        4.585s        26.10%        4.585s       5.240ms           875  
+                        _C::cpu_attention_with_kv_cache        24.07%        4.228s        24.07%        4.228s       5.033ms           840  
+## Call CompiledFxGraph ft6vmfm4elshrxxczx75oo6n7bwg...        19.55%        3.435s        19.55%        3.435s     101.037ms            34  
+                                            aten::addmm        18.42%        3.236s        19.56%        3.436s       1.363ms          2520  
+                        ## Call CompiledFxGraph None ##         8.51%        1.494s        72.43%       12.724s     363.543ms            35  
+                                            aten::copy_         1.11%     195.744ms         1.11%     195.744ms      64.880us          3017  
+                         _C::cpu_attn_reshape_and_cache         0.80%     140.474ms         0.80%     140.474ms     167.231us           840  
+               execute_context_0(0)_generation_256(256)         0.46%      80.625ms        51.09%        8.976s     320.575ms            28  
+                                             aten::div_         0.35%      61.616ms         0.35%      61.616ms       1.760ms            35  
+                    vllm::unified_attention_with_output         0.31%      53.780ms        25.22%        4.431s       5.275ms           840  
+          execute_context_125(3968)_generation_128(128)         0.03%       5.112ms        11.61%        2.040s        2.040s             1  
+               execute_context_0(0)_generation_128(128)         0.03%       4.933ms         1.08%     189.434ms     189.434ms             1  
+              execute_context_128(4095)_generation_1(1)         0.02%       4.114ms        11.22%        1.971s        1.971s             1  
+                                           aten::unbind         0.02%       3.912ms         0.04%       7.437ms       8.853us           840  
+                                      Pregraph bytecode         0.02%       3.891ms         0.02%       3.891ms      55.585us            70  
+                             Torch-Compiled Region: 1/0         0.02%       3.338ms        19.58%        3.440s     101.164ms            34  
+                                            aten::index         0.02%       3.082ms         0.02%       3.836ms      54.798us            70  
+               execute_context_0(0)_generation_255(255)         0.02%       3.059ms         1.85%     325.298ms     325.298ms             1  
+              execute_context_4(97)_generation_252(252)         0.02%       2.943ms         2.03%     356.274ms     356.274ms             1  
+                                       aten::as_strided         0.02%       2.803ms         0.02%       2.803ms       0.473us          5922  
+                                           aten::select         0.02%       2.773ms         0.02%       3.525ms       2.098us          1680  
+                   execute_context_0(0)_generation_4(4)         0.02%       2.692ms         0.65%     114.243ms     114.243ms             1  
+                                           aten::expand         0.01%       2.175ms         0.02%       3.247ms       3.866us           840  
+                                            aten::slice         0.01%       2.158ms         0.02%       2.915ms       0.903us          3227  
+                  execute_context_1(32)_generation_0(0)         0.01%       1.915ms         0.52%      90.637ms      90.637ms             1  
+                                     aten::resolve_conj         0.01%       1.761ms         0.01%       1.761ms       0.255us          6895  
+                               TorchDynamo Cache Lookup         0.01%     921.742us         0.01%     921.742us      26.335us            35  
+## Call CompiledFxGraph fzorbp33l5kwl3himngxysc4k6bk...         0.00%     876.535us         0.01%     885.618us     885.618us             1  
+                 AOTDispatcher Runtime Wrapper Prologue         0.00%     820.117us         0.00%     820.117us      11.716us            70  
+                             _C::get_scheduler_metadata         0.00%     347.831us         0.00%     395.248us      11.293us            35  
+                                         aten::_to_copy         0.00%     320.458us         0.01%       1.234ms       8.812us           140  
+                                               aten::to         0.00%     318.616us         0.01%       1.552ms       5.544us           280  
+                                    aten::empty_strided         0.00%     281.990us         0.00%     281.990us       2.014us           140  
+                                        aten::unsqueeze         0.00%     275.040us         0.00%     390.580us       5.580us            70  
+                                              aten::add         0.00%     266.248us         0.00%     266.248us       2.536us           105  
+                                          aten::random_         0.00%     263.166us         0.00%     263.166us       7.519us            35  
+                   execute_context_0(0)_generation_0(0)         0.00%     206.665us         0.00%     210.790us     210.790us             1  
+                                           aten::linear         0.00%     199.208us         6.96%        1.223s      34.942ms            35  
+                                          aten::randint         0.00%     183.122us         0.00%     475.119us      13.575us            35  
+                                             aten::view         0.00%     173.169us         0.00%     173.169us       1.649us           105  
+                                     aten::index_select         0.00%     166.414us         0.00%     166.414us       4.755us            35  
+                                            aten::fill_         0.00%     165.878us         0.00%     165.878us       0.948us           175  
+                   _C::compute_slot_mapping_kernel_impl         0.00%     125.623us         0.00%     125.623us       3.589us            35  
+                                                aten::t         0.00%     124.670us         0.00%     200.751us       5.736us            35  
+                                           aten::matmul         0.00%     124.665us         6.96%        1.223s      34.931ms            35  
+                                               aten::lt         0.00%     111.166us         0.00%     111.166us       3.176us            35  
+                                              aten::sub         0.00%      97.255us         0.00%     173.377us       4.954us            35  
+                                            aten::alias         0.00%      87.121us         0.00%      87.121us       2.489us            35  
+                                          aten::flatten         0.00%      77.290us         0.00%     169.458us       4.842us            35  
+                             Torch-Compiled Region: 1/1         0.00%      66.750us         0.01%     978.700us     978.700us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 17.568s
+

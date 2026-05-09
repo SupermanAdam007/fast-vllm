@@ -16,3 +16,4 @@
 {"timestamp": "2026-05-09T17:54:06.519203+00:00", "label": "flag: batch=256", "tokens_per_sec": 463.59, "avg_latency_ms": 17670.722175436094, "p99_ms": 18218.174172090366, "config_flags": ""}
 {"timestamp": "2026-05-09T18:22:38.799911+00:00", "label": "inductor: max_autotune_gemm_backends=AT_BLAS", "tokens_per_sec": 473.7, "avg_latency_ms": 17293.534667021595, "p99_ms": 17561.273675384, "config_flags": ""}
 {"timestamp": "2026-05-09T18:26:55.410646+00:00", "label": "inductor: cpp.simdlen=256", "tokens_per_sec": 466.62, "avg_latency_ms": 17556.120291398838, "p99_ms": 17689.450701978058, "config_flags": ""}
+{"timestamp": "2026-05-09T19:12:56.443827+00:00", "label": "code: apply_temperature skip at T=1.0", "tokens_per_sec": 480.15, "avg_latency_ms": 17061.33120842278, "p99_ms": 17085.407753046602, "config_flags": ""}
