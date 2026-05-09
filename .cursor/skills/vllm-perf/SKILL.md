@@ -27,6 +27,9 @@ Flag/batch tuning is exhausted as of 2026-05-09:
 
 **Sessions should start CodeEdit work directly.** Skip batch tuning entirely unless the profiler shows a new compute regime. The question is no longer "what flags to set" — it is "what in the vLLM implementation is leaving throughput on the table."
 
+Landed CodeEdits as of 2026-05-09:
+- `apply_temperature` skip when T=1.0: +3.6%, baseline now 480.1 tok/s
+
 ### What "compute-bound" means for code targets
 
 At batch=256, float32, ~18s per iteration (32 decode steps), each decode step takes ~550ms. Model compute (matmuls, attention) dominates. This means:
@@ -43,7 +46,8 @@ Both CodeEdit and InductorConfig fixes follow the measure-commit-or-revert disci
 
 - vLLM has **no MPS backend** on macOS. The only valid device is CPU.
 - All optimizations in this skill are CPU-compatible only.
-- **`--device cpu` is NOT a valid flag for `vllm bench latency`** — it will error. Device is auto-detected. `--device cpu` only works with `python -m vllm.benchmarks.latency` (legacy module path used only for profiling).
+- **`--device cpu` is NOT a valid flag for `vllm bench latency`** — it will error. Device is auto-detected.
+- **`python -m vllm.benchmarks.latency` is dead code** — `vllm/benchmarks/latency.py` has no `__main__` guard; the module exits silently with no output. Use `vllm bench latency` for ALL benchmarking and profiling.
 - Benchmarking (`--output-json`) and profiling (`--profile`) are **mutually exclusive** in one invocation — always run them as separate commands.
 - **"Inductor compilation was disabled by user settings" warning is a false alarm on CPU.** The CPU platform's `inference_mode()` converts mode=VLLM_COMPILE → DYNAMO_TRACE_ONCE + inductor backend. The warning fires in a second VllmConfig `__post_init__` (after the platform has already set up compilation correctly) because mode≠VLLM_COMPILE at that point. The model IS compiled with torch.compile + inductor. Do not treat this warning as a hypothesis.
 
@@ -84,7 +88,7 @@ LOG_FILE           = docs/perf/cpu_opt_log.md
 SKILL_DIR          = .cursor/skills/vllm-perf
 ```
 
-**Stable baseline (as of 2026-05-09):** 463.6 tok/s at batch=256, float32, in=32, out=32.
+**Stable baseline (as of 2026-05-09):** 480.1 tok/s at batch=256, float32, in=32, out=32.
 If `perf_results/baseline.json` shows a higher number, use that — it means a prior session landed a code improvement.
 
 **tokens/sec formula (the only valid cross-run metric):**
@@ -445,6 +449,7 @@ Use when the code scan didn't surface an obvious target. Listed by the profiler 
 | `--compilation-config '{"level":3}'` | Errors | No `level` field in CompilationConfig |
 | `inductor max_autotune_gemm_backends=AT_BLAS` (alone) | +2.2% (below 3%) | Sub-threshold; LLVM already dispatches to Accelerate BLAS on ARM. All percentiles improved directionally (p99 −3.6%) but avg tok/s below acceptance bar. |
 | `inductor cpp.simdlen=256` (alone) | +0.7% (noise) | LLVM auto-vectorization already handles NEON widths optimally; explicit hint adds no measurable gain. |
+| `inductor freezing=True` | Compilation timeout (>9 min) | With a 0.5B model, inductor attempts to constant-fold all weight matrices into the compiled C++ binary — the compile phase hangs indefinitely. Do not use. |
 
 **Stop condition (any one):**
 - `MAX_ITERS` (5) attempts completed
@@ -602,10 +607,11 @@ Use `perf_results/prof/` (workspace-relative, survives reboots).
 ```bash
 mkdir -p perf_results/prof
 
-# NOTE: --device cpu IS valid here (python -m path, not vllm bench latency)
-.venv/bin/python -m vllm.benchmarks.latency \
+# NOTE: Use .venv/bin/vllm bench latency --profile (NOT python -m vllm.benchmarks.latency —
+# that module has no __main__ guard and silently exits with no output).
+# --profile and --output-json are mutually exclusive — do NOT add --output-json here.
+VLLM_CPU_KVCACHE_SPACE=1 .venv/bin/vllm bench latency \
   --model Qwen/Qwen2.5-0.5B-Instruct \
-  --device cpu \
   --dtype float32 \
   --batch-size 256 \
   --input-len 32 \
@@ -618,12 +624,11 @@ mkdir -p perf_results/prof
     "torch_profiler_dir": "perf_results/prof",
     "warmup_iterations": 0,
     "active_iterations": 1
-  }'
+  }' 2>&1 | tee /tmp/prof_run.log | grep -E "Self CPU|aten::|_C::|CompiledFx" | head -60
 
-# Save summary for Phase 2 evidence reading
-.venv/bin/python tools/profiler/print_layerwise_table.py \
-  --output-file perf_results/prof --type summary \
-  > perf_results/prof_summary.txt 2>&1
+# The profiler dumps a text table to perf_results/prof/profiler_out_0.txt automatically.
+# print_layerwise_table.py is broken (ModuleNotFoundError: _typeshed). Use the raw output instead:
+cp perf_results/prof/profiler_out_0.txt perf_results/prof_summary.txt
 cat perf_results/prof_summary.txt
 ```
 
@@ -635,6 +640,20 @@ cat perf_results/prof_summary.txt
 | `aten::copy_` > 15% | Tensor copies in hot path | Cache decode arrays, investigate copy sites |
 | `aten::scaled_dot_product_attention` > 30% | Attention bandwidth | block-size sweep, chunked prefill off |
 | Python frames > 10% wall | Python overhead per step | Hoist dead branches, cache per-step metadata |
+
+**Empirical profile (2026-05-09, batch=256 float32):**
+```
+aten::mm                         26.1%   4.585s  875 calls   5.24ms avg  QKV×24 + lm_head×35
+_C::cpu_attention_with_kv_cache  24.1%   4.228s  840 calls   5.03ms avg  C++ custom kernel — needs rebuild
+CompiledFxGraph SELF             19.6%   3.435s   34 calls 101ms   avg   inductor fused elem-wise (invisible to aten profiler)
+aten::addmm                      18.4%   3.236s 2520 calls   1.36ms avg  GEMM+residual fused by inductor (3/layer × 24)
+aten::copy_                       1.1%    196ms  3017 calls  64.9us avg  inside compiled graph; unknown origin
+aten::div_                        0.35%   61ms     35 calls   1.76ms avg  → FIXED: skip when temp=1.0
+```
+**Remaining targets (require C++ or quantized model):**
+- GEMM (44.5%): weight-only INT8/INT4 (AWQ) — needs `cpu_awq` quantized checkpoint + non-fp32 activation
+- Attention (24.1%): `cpu_attention_with_kv_cache` C++ kernel — ARM NEON GQA path, needs C++ rebuild
+- Compiled element-wise (19.6%): already fused by inductor, no Python-level gain found
 
 ---
 
@@ -716,3 +735,5 @@ Record tested hypotheses here so future sessions don't repeat them.
 | 2026-05-09 | **batch=256 (from 128)** | **+4.6% ✓** | Latency ratio 1.91× — above 1.7× stop threshold; batch scaling exhausted. Baseline now 463.6 tok/s. |
 | 2026-05-09 | inductor max_autotune_gemm_backends=AT_BLAS | ~+2.2% (sub-threshold) | All percentiles improved (p50 −2.8%, p90 −3.0%, p99 −3.6%). Below 3% tok/s bar. Ran without profiler evidence — lesson: run Phase 4 first. |
 | 2026-05-09 | inductor cpp.simdlen=256 | +0.7% ✗ (noise) | LLVM auto-vectorization already optimal on ARM NEON. Ran without profiler evidence. |
+| 2026-05-09 | inductor freezing=True (in cpu.py) | ✗ compilation timeout | Causes inductor to try embedding all 0.5B weights as compile-time constants — compile hangs indefinitely. |
+| 2026-05-09 | **apply_temperature skip (T=1.0)** | **+3.6% ✓** | CodeEdit: `sampler.py` skips `logits.div_(temp)` when `(temp==1.0).all()`. Saves 156 MB LLC-thrashing write per forward pass. Baseline → 480.1 tok/s. |
