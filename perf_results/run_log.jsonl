@@ -14,3 +14,5 @@
 {"timestamp": "2026-05-09T17:30:45.314939+00:00", "label": "flag: cpp.enable_concat_linear=true", "tokens_per_sec": 423.06, "avg_latency_ms": 9681.886233598925, "p99_ms": 10930.504574705847, "config_flags": ""}
 {"timestamp": "2026-05-09T17:49:13.170435+00:00", "label": "code: decode-only req_indices shortcut (skip np.repeat)", "tokens_per_sec": 433.88, "avg_latency_ms": 9440.376850008033, "p99_ms": 9559.075832003728, "config_flags": ""}
 {"timestamp": "2026-05-09T17:54:06.519203+00:00", "label": "flag: batch=256", "tokens_per_sec": 463.59, "avg_latency_ms": 17670.722175436094, "p99_ms": 18218.174172090366, "config_flags": ""}
+{"timestamp": "2026-05-09T18:22:38.799911+00:00", "label": "inductor: max_autotune_gemm_backends=AT_BLAS", "tokens_per_sec": 473.7, "avg_latency_ms": 17293.534667021595, "p99_ms": 17561.273675384, "config_flags": ""}
+{"timestamp": "2026-05-09T18:26:55.410646+00:00", "label": "inductor: cpp.simdlen=256", "tokens_per_sec": 466.62, "avg_latency_ms": 17556.120291398838, "p99_ms": 17689.450701978058, "config_flags": ""}
