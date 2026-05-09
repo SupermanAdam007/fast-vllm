@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "/Users/adam.pavlat/projects/fast-vllm/tools/profiler/print_layerwise_table.py", line 7, in <module>
-    from vllm.profiler.layerwise_profile import ModelStatsEntry, SummaryStatsEntry
-  File "/Users/adam.pavlat/projects/fast-vllm/vllm/profiler/layerwise_profile.py", line 15, in <module>
-    from vllm.profiler.utils import (
-  File "/Users/adam.pavlat/projects/fast-vllm/vllm/profiler/utils.py", line 7, in <module>
-    from _typeshed import DataclassInstance
-ModuleNotFoundError: No module named '_typeshed'

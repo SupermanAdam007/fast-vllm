@@ -17,3 +17,6 @@
 | 10 | inductor | cpp.enable_concat_linear=true | — | -4.6% (miss) | cd9a938 |
 | 11 | code | decode req_indices shortcut (skip np.repeat) | — | -2.1% (noise; compute-bound) | abd11fb |
 | 12 | flag | batch=256 | 463.6 | +4.6% | aac63aa (latency ratio 1.91× — plateau) |
+| 13 | inductor | max_autotune_gemm_backends=AT_BLAS | — | ~+2.2% (below 3% threshold) | reverted |
+| 14 | inductor | cpp.simdlen=256 | — | +0.7% (noise) | reverted |
+| 15 | code | apply_temperature skip when T=1.0 | 480.1 | +3.6% | 6cd1a0e |

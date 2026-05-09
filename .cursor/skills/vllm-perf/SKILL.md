@@ -82,14 +82,14 @@ GPU_MEM_UTIL       = 0.3       # DEPRECATED for benchmarking — kept for refere
                                # Use KV_CACHE_SPACE above. --gpu-memory-utilization 0.3 fails
                                # whenever system free RAM < 4.8 GB (Cursor + OS + model use ~11+ GB).
 MAX_ITERS          = 5
-RESULTS_DIR        = perf_results   # workspace-relative — survives reboots
+SCRATCH_DIR        = /tmp/vllm_perf  # session-only scratch — never committed
 BRANCH             = perf/vllm-cpu-opt
-LOG_FILE           = docs/perf/cpu_opt_log.md
+LOG_FILE           = docs/perf/cpu_opt_log.md   # single source of truth — git-tracked
 SKILL_DIR          = .cursor/skills/vllm-perf
 ```
 
 **Stable baseline (as of 2026-05-09):** 480.1 tok/s at batch=256, float32, in=32, out=32.
-If `perf_results/baseline.json` shows a higher number, use that — it means a prior session landed a code improvement.
+The latest accepted tok/s is always the last `✓` row in `docs/perf/cpu_opt_log.md` — that is the only persistent record.
 
 **tokens/sec formula (the only valid cross-run metric):**
 ```
@@ -175,8 +175,8 @@ else:
 # 7. Optimization branch (all changes land here)
 git checkout -b perf/vllm-cpu-opt 2>/dev/null || git checkout perf/vllm-cpu-opt
 
-# 8. Results dir + log
-mkdir -p perf_results docs/perf
+# 8. Session scratch dir + log file
+mkdir -p /tmp/vllm_perf docs/perf
 [ -f docs/perf/cpu_opt_log.md ] || cat > docs/perf/cpu_opt_log.md << 'EOF'
 # vLLM CPU Optimization Log
 
@@ -186,31 +186,13 @@ mkdir -p perf_results docs/perf
 |---|------|-----|-------|-------|--------|
 EOF
 
-# 9. Validate existing baseline.json before skipping Phase 1.
-#    The raw JSON from `vllm bench latency` does NOT store input_len.
-#    bench_compare.py --wrap trusts whatever --input-len you pass on the CLI.
-.venv/bin/python -c "
-import json, sys, os
-path = 'perf_results/baseline.json'
-if not os.path.exists(path):
-    print('No baseline.json — must run Phase 1.')
-    sys.exit(0)
-b = json.load(open(path))
-stored_in  = b.get('input_len')
-stored_out = b.get('output_len')
-stored_bs  = b.get('batch_size')
-tps  = b.get('tokens_per_sec', 0)
-lat  = b.get('avg_latency_s', 0)
-computed_bs_x_out = tps * lat
-expected = stored_bs * stored_out if stored_bs and stored_out else 0
-print(f'Baseline: batch={stored_bs}, input_len={stored_in}, output_len={stored_out}')
-print(f'  tokens_per_sec = {tps:.1f}, avg_latency = {lat:.2f}s')
-print(f'  Implied batch*output = {computed_bs_x_out:.0f} (expected {expected})')
-if expected and abs(computed_bs_x_out - expected) > expected * 0.05:
-    print('WARNING: Mismatch >5%. Baseline may be mislabeled. Re-run Phase 1.')
-else:
-    print('Baseline integrity: OK')
-" 2>/dev/null || echo "baseline.json missing or unreadable — run Phase 1"
+# 9. Read baseline from the log — this is the only persistent record.
+echo "=== Accepted results so far ==="
+grep "✓" docs/perf/cpu_opt_log.md || echo "(none yet — run Phase 1)"
+echo ""
+echo "Session scratch: /tmp/vllm_perf/ (baseline.json lives here for this session only)"
+[ -f /tmp/vllm_perf/baseline.json ] && echo "  baseline.json found — can skip Phase 1." || \
+  echo "  No baseline.json yet — run Phase 1 to establish one."
 ```
 
 ---
@@ -255,11 +237,10 @@ print('          If roughly equal, bf16 saves memory — prefer --dtype bfloat16
 
 ## Phase 1 — Baseline Benchmark
 
-**Skip this phase only if baseline.json exists AND the Phase 0 sanity check
-confirmed batch×output matches (i.e., `implied batch×output ≈ stored batch×output`).**
+**Skip this phase only if `/tmp/vllm_perf/baseline.json` exists in this session.**
+At the start of a new session the file is gone — always re-run Phase 1 then.
 
-If baseline.json exists but fails the sanity check, overwrite it by re-running this phase
-with the correct parameters. Never carry forward a stale or mislabeled baseline.
+If baseline.json exists but the numbers look off (implied batch×output doesn't match stored values), overwrite it by re-running this phase. Never carry forward a stale baseline.
 
 **Use the dtype determined by Phase 0.5.** On ARM, this MUST be float32.
 
@@ -276,20 +257,19 @@ VLLM_CPU_KVCACHE_SPACE=1 .venv/bin/vllm bench latency \
   --output-len 32 \
   --num-iters-warmup 2 \
   --num-iters 5 \
-  --output-json perf_results/baseline_raw.json
+  --output-json /tmp/vllm_perf/baseline_raw.json
 
 # Step 1b: enrich (always pass --input-len and --output-len — raw JSON omits both)
 .venv/bin/python .cursor/skills/vllm-perf/bench_compare.py \
-  --wrap perf_results/baseline_raw.json \
+  --wrap /tmp/vllm_perf/baseline_raw.json \
   --batch-size 256 \
   --input-len 32 \
   --output-len 32 \
   --label "baseline: float32, batch=256, in=32, out=32" \
-  --save perf_results/baseline.json \
-  --append-log perf_results/run_log.jsonl
+  --save /tmp/vllm_perf/baseline.json
 ```
 
-Read the printed `tokens_per_sec`. Append to log:
+Read the printed `tokens_per_sec`. Append to `docs/perf/cpu_opt_log.md`:
 ```
 | 0 | flag | Baseline (float32, batch=256) | {tok/s} | — | N/A |
 ```
@@ -308,16 +288,16 @@ You are working on improving the vLLM implementation. Flag tuning is done. Your 
 ### Step 2a — Read the Evidence
 
 ```bash
-# Run history — check what has been tried and what each result ruled out
-cat perf_results/run_log.jsonl 2>/dev/null || echo "(no runs yet)"
+# Run history — the authoritative record is docs/perf/cpu_opt_log.md
+cat docs/perf/cpu_opt_log.md
 
-# Profiler summary — the most valuable input for hypothesis generation
-cat perf_results/prof_summary.txt 2>/dev/null || echo "(no profile yet — run Phase 4 before iteration 1)"
+# Profiler summary — session scratch in /tmp/vllm_perf/
+cat /tmp/vllm_perf/prof_summary.txt 2>/dev/null || echo "(no profile yet — run Phase 4 before iteration 1)"
 ```
 
 **If no profiler data exists yet, run Phase 4 first. This is a hard rule, not a suggestion.**
 
-Empirical lesson (2026-05): two sessions skipped the profiler and went straight to catalog hypotheses. Both misses. The catalog items `max_autotune_gemm_backends=AT_BLAS` (+2.2%) and `cpp.simdlen=256` (+0.7%) produced sub-threshold results because we had no profiler evidence that GEMM dispatch was the actual bottleneck. The profiler is the only way to know which op to target. **STOP. Do not proceed to Step 2d until `perf_results/prof_summary.txt` exists and has been read.**
+Empirical lesson (2026-05): two sessions skipped the profiler and went straight to catalog hypotheses. Both misses. The catalog items `max_autotune_gemm_backends=AT_BLAS` (+2.2%) and `cpp.simdlen=256` (+0.7%) produced sub-threshold results because we had no profiler evidence that GEMM dispatch was the actual bottleneck. The profiler is the only way to know which op to target. **STOP. Do not proceed to Step 2d until `/tmp/vllm_perf/prof_summary.txt` exists and has been read.**
 
 ### Step 2b — Forward-Pass Code Scan
 
@@ -525,25 +505,24 @@ VLLM_CPU_KVCACHE_SPACE=1 .venv/bin/vllm bench latency \
   --num-iters-warmup 2 \
   --num-iters 5 \
   <extra-flags-if-flag-fix> \
-  --output-json perf_results/candidate_N_raw.json
+  --output-json /tmp/vllm_perf/candidate_N_raw.json
 
 # Always pass --input-len and --output-len explicitly — raw JSON omits both.
 .venv/bin/python .cursor/skills/vllm-perf/bench_compare.py \
-  --wrap perf_results/candidate_N_raw.json \
+  --wrap /tmp/vllm_perf/candidate_N_raw.json \
   --batch-size <BATCH_SIZE_USED> \
   --input-len 32 \
   --output-len 32 \
   --label "<type>: <short fix description>" \
-  --save perf_results/candidate_N.json \
-  --append-log perf_results/run_log.jsonl
+  --save /tmp/vllm_perf/candidate_N.json
 ```
 
 ### Step 3d — Compare
 
 ```bash
 .venv/bin/python .cursor/skills/vllm-perf/bench_compare.py \
-  --baseline perf_results/baseline.json \
-  --candidate perf_results/candidate_N.json
+  --baseline /tmp/vllm_perf/baseline.json \
+  --candidate /tmp/vllm_perf/candidate_N.json
 ```
 
 `bench_compare.py` exits 0 (accepted) if tokens/sec improved ≥ 3% and no latency
@@ -557,8 +536,15 @@ and evaluate tokens_per_sec only. This is correct behavior — accept it.
 **If accepted (exit code 0):**
 
 ```bash
-# Commit everything (results + code edits)
-git add perf_results/ docs/perf/
+# Promote candidate to new session baseline (stays in /tmp — gone after reboot)
+cp /tmp/vllm_perf/candidate_N.json /tmp/vllm_perf/baseline.json
+
+# Append to the ONLY git-tracked log — docs/perf/cpu_opt_log.md
+# Edit the file: add a new row:
+# | N | <Flag/InductorConfig/Code> | <fix description> | {tok/s} | +{delta}% | {SHA} |
+
+# Commit: log + code edits only
+git add docs/perf/cpu_opt_log.md
 # For CodeEdit, also stage the changed source file(s):
 # git add vllm/path/to/changed_file.py
 git commit -m "perf(cpu): <one-line fix description>
@@ -569,15 +555,10 @@ batch_size={N}, input_len=32, output_len=32"
 # NEVER add Co-authored-by, Assisted-by, or any AI attribution trailers to commits.
 
 COMMIT_SHA=$(git rev-parse --short HEAD)
-
-# Promote candidate to new baseline
-cp perf_results/candidate_N.json perf_results/baseline.json
-
-# Append to log
-# | N | <Flag/InductorConfig/Code> | <fix description> | {tok/s} | +{delta}% | {SHA or N/A} |
 ```
 
-**Note:** `winning_config.sh` lives under `.cursor/` which is gitignored. Winning flags are reliably recorded only in `perf_results/run_log.jsonl` (which IS committed). Read the run log to reconstruct the winning invocation; do not rely on `winning_config.sh` across sessions.
+**The only committed artifact is `docs/perf/cpu_opt_log.md` + the changed source files.**
+Benchmark JSON lives in `/tmp/vllm_perf/` for this session only. At the start of a new session, re-run Phase 1 to rebuild baseline.json.
 
 **If rejected (exit code 1):**
 
@@ -585,11 +566,12 @@ cp perf_results/candidate_N.json perf_results/baseline.json
 # Revert code edits (flag fixes need no revert)
 git checkout -- vllm/
 
-# Append miss
+# Append miss to docs/perf/cpu_opt_log.md, then commit the log
 # | N | <Flag/Code> | <fix description> | — | {delta}% (miss) | reverted |
+git add docs/perf/cpu_opt_log.md && git commit -m "perf(cpu): log miss iter N"
 ```
 
-**After logging:** increment N, return to Phase 2. Re-read `perf_results/run_log.jsonl`
+**After logging:** increment N, return to Phase 2. Re-read `docs/perf/cpu_opt_log.md`
 and reason about what the result reveals before picking the next fix.
 
 ---
@@ -600,12 +582,12 @@ Run when the optimization loop stalls (2 consecutive misses or MAX_ITERS hit) to
 new evidence for Phase 2 hypothesis generation.
 
 Profiling is a **separate** invocation — `--profile` does not save `--output-json`.
-Use `perf_results/prof/` (workspace-relative, survives reboots).
+Session scratch goes to `/tmp/vllm_perf/prof/`.
 
 **Use the same dtype as your current baseline (float32 on ARM).**
 
 ```bash
-mkdir -p perf_results/prof
+mkdir -p /tmp/vllm_perf/prof
 
 # NOTE: Use .venv/bin/vllm bench latency --profile (NOT python -m vllm.benchmarks.latency —
 # that module has no __main__ guard and silently exits with no output).
@@ -621,15 +603,15 @@ VLLM_CPU_KVCACHE_SPACE=1 .venv/bin/vllm bench latency \
   --profile \
   --profiler-config '{
     "profiler": "torch",
-    "torch_profiler_dir": "perf_results/prof",
+    "torch_profiler_dir": "/tmp/vllm_perf/prof",
     "warmup_iterations": 0,
     "active_iterations": 1
-  }' 2>&1 | tee /tmp/prof_run.log | grep -E "Self CPU|aten::|_C::|CompiledFx" | head -60
+  }' 2>&1 | tee /tmp/vllm_perf/prof_run.log | grep -E "Self CPU|aten::|_C::|CompiledFx" | head -60
 
-# The profiler dumps a text table to perf_results/prof/profiler_out_0.txt automatically.
+# The profiler dumps a text table to profiler_out_0.txt automatically.
 # print_layerwise_table.py is broken (ModuleNotFoundError: _typeshed). Use the raw output instead:
-cp perf_results/prof/profiler_out_0.txt perf_results/prof_summary.txt
-cat perf_results/prof_summary.txt
+cp /tmp/vllm_perf/prof/profiler_out_0.txt /tmp/vllm_perf/prof_summary.txt
+cat /tmp/vllm_perf/prof_summary.txt
 ```
 
 **Do not pick the next fix here.** Return to Phase 2 and reason from the numbers.
@@ -660,8 +642,10 @@ aten::div_                        0.35%   61ms     35 calls   1.76ms avg  → FI
 ## Phase 5 — Final Report
 
 ```bash
+# docs/perf/cpu_opt_log.md should already be staged at each iteration's commit.
+# If any entries were logged without committing, stage them now:
 git add docs/perf/cpu_opt_log.md
-git commit -m "perf(cpu): add optimization run log"
+git diff --cached --quiet || git commit -m "perf(cpu): finalize optimization run log"
 # NEVER add Co-authored-by, Assisted-by, or any AI attribution trailers to commits.
 ```
 
@@ -685,7 +669,7 @@ git checkout main
 git branch -D perf/vllm-cpu-opt
 ```
 
-Winning flags are recorded in `perf_results/run_log.jsonl` (committed). `winning_config.sh` is gitignored and may be stale — use the run log as the source of truth.
+Winning changes are recorded in `docs/perf/cpu_opt_log.md` (git-tracked). Benchmark JSON is session-only in `/tmp/vllm_perf/` and is gone after a reboot.
 
 ---
 
@@ -715,7 +699,7 @@ Winning flags are recorded in `perf_results/run_log.jsonl` (committed). `winning
 
 Record tested hypotheses here so future sessions don't repeat them.
 
-**Important:** this file is gitignored under `.cursor/`. Copy new rows into it at the end of every session. The machine-readable source of truth is `perf_results/run_log.jsonl` (committed).
+**Important:** this file lives under `.cursor/` which is gitignored. The git-tracked source of truth for all iterations is `docs/perf/cpu_opt_log.md`. Copy new rows there at the end of every session.
 
 **Sub-threshold signal convention:** if a fix improved ALL latency percentiles but tok/s stayed below 3%, mark it `~+N% (sub-threshold)`. Do not re-run the same fix alone; it is a candidate for combination only.
 
