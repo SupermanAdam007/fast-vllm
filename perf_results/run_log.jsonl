@@ -3,3 +3,5 @@
 {"timestamp": "2026-05-09T16:10:08.816754+00:00", "label": "iter1: batch=8", "tokens_per_sec": 60.32, "avg_latency_ms": 4244.116847325738, "p99_ms": 4251.4164115302265, "config_flags": "", "delta_pct": 43.6, "accepted": false}
 {"timestamp": "2026-05-09T16:12:10.089363+00:00", "label": "iter2: OMP_NUM_THREADS=8", "tokens_per_sec": 58.96, "avg_latency_ms": 4341.573680285364, "p99_ms": 4382.315017727669, "config_flags": ""}
 {"timestamp": "2026-05-09T16:12:10.130400+00:00", "label": "iter2: OMP_NUM_THREADS=8", "tokens_per_sec": 58.96, "avg_latency_ms": 4341.573680285364, "p99_ms": 4382.315017727669, "config_flags": "", "delta_pct": -2.3, "accepted": false}
+{"timestamp": "2026-05-09T16:19:38.542362+00:00", "label": "iter3: block-size=32", "tokens_per_sec": 60.08, "avg_latency_ms": 4260.943458555266, "p99_ms": 4334.786661663093, "config_flags": ""}
+{"timestamp": "2026-05-09T16:22:18.551988+00:00", "label": "iter4: batch=16", "tokens_per_sec": 68.02, "avg_latency_ms": 7527.710091602057, "p99_ms": 7636.539588589221, "config_flags": ""}
